@@ -45,6 +45,8 @@ use std::time::Instant;
 
 use tokio::io::Registration;
 
+const RECV_BUF_SIZE: usize = 2048;
+
 /// The I/O Resource should be spawned onto a Tokio compatible reactor.
 ///
 /// If you need to ever cancel this resource (i e disconnect from D-Bus),
@@ -59,12 +61,28 @@ impl<C: AsRef<Channel> + Process> IOResource<C> {
     fn poll_internal(&mut self, ctx: &mut task::Context<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let c: &Channel = (*self.connection).as_ref();
 
-        c.read_write(Some(Default::default()))
-            .and_then(|_| c.read_write(Some(Default::default())))
-            .map_err(|_| Error::new_failed("Read/write failed"))?;
-        self.connection.process_all();
-
         let w = c.watch();
+
+        let read_write = || c.read_write(Some(Default::default())).map_err(|_| Error::new_failed("Read/write failed"));
+        read_write()?;
+        if w.read {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            loop {
+                unsafe {
+                    if libc::recv(w.fd, buf.as_mut_ptr() as *mut std::ffi::c_void, RECV_BUF_SIZE, libc::MSG_DONTWAIT | libc::MSG_PEEK) == -1
+                    {
+                        let errno = *libc::__errno_location();
+                        if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
+                            break;
+                        } else {
+                            return Err(Box::new(Error::new_failed("recv failed")));
+                        }
+                    }
+                };
+                read_write()?;
+            }
+        }
+        self.connection.process_all();
 
         let r = match &self.registration {
             None => {
